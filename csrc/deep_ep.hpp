@@ -8,6 +8,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <tuple>
 #include <vector>
@@ -81,7 +82,10 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    cudaStream_t comm_stream;
+
+    phi::distributed::NCCLCommContext* comm_ctx;
+    phi::GPUContext* calc_ctx;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -120,7 +124,8 @@ public:
            bool low_latency_mode,
            bool explicitly_destroy,
            bool enable_shrink,
-           bool use_fabric);
+           bool use_fabric,
+           int context_ring_id);
 
     ~Buffer() noexcept(false);
 
@@ -142,7 +147,7 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    torch::Stream get_comm_stream() const;
+    cudaStream_t get_comm_stream() const;
 
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,

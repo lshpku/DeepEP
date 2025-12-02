@@ -61,7 +61,7 @@ class EventOverlap:
             self.event.current_stream_wait()
 
 
-def check_nvlink_connections(group: dist.ProcessGroup):
+def check_nvlink_connections(group):
     """
     Check NVLink connection between every pair of GPUs.
 

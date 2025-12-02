@@ -4,8 +4,10 @@ import setuptools
 import importlib
 
 from pathlib import Path
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
+from paddle.utils.cpp_extension import BuildExtension, CUDAExtension
+from paddle.utils.cpp_extension.extension_utils import (
+    add_compile_flag,
+)
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
 def get_nvshmem_host_lib_name(base_dir):
@@ -56,7 +58,7 @@ if __name__ == '__main__':
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Prefer A100
-        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '8.0')
+        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '8.0')
 
         # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
@@ -66,13 +68,13 @@ if __name__ == '__main__':
         assert disable_nvshmem
     else:
         # Prefer H800 series
-        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
+        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '9.0')
 
-        # CUDA 12 flags
-        nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+    # CUDA 12 flags
+    nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
-    if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
+    if os.environ['PADDLE_CUDA_ARCH_LIST'].strip() != '9.0':
         assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
         os.environ['DISABLE_AGGRESSIVE_PTX_INSTRS'] = '1'
 
@@ -102,7 +104,7 @@ if __name__ == '__main__':
     print(f' > Libraries: {library_dirs}')
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
-    print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
+    print(f' > Arch list: {os.environ["PADDLE_CUDA_ARCH_LIST"]}')
     print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
@@ -112,6 +114,12 @@ if __name__ == '__main__':
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
     except Exception as _:
         revision = ''
+
+    add_compile_flag(extra_compile_args, ['-DPADDLE_WITH_CUDA'])
+    add_compile_flag(extra_compile_args, ['-DWITH_DISTRIBUTE'])
+    add_compile_flag(extra_compile_args, ['-DWITH_NVSHMEM'])
+    add_compile_flag(extra_compile_args, ['-DWITH_GPU'])
+    add_compile_flag(extra_compile_args, ['-DWITH_FLUID_ONLY'])
 
     setuptools.setup(name='deep_ep',
                      version='1.2.1' + revision,

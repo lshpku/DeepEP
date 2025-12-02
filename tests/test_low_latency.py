@@ -5,6 +5,8 @@ import torch.distributed as dist
 from functools import partial
 from typing import Literal, Set
 
+from paddle.distributed.communication.group import Group
+
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
@@ -40,7 +42,7 @@ def test_main(num_tokens: int,
               num_topk: int,
               rank: int,
               num_ranks: int,
-              group: dist.ProcessGroup,
+              group: Group,
               buffer: deep_ep.Buffer,
               use_logfmt: bool = False,
               shrink_test: bool = False,
