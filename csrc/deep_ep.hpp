@@ -18,6 +18,9 @@
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
 
+#include "paddle/phi/core/memory/allocation/allocator_facade.h"
+#include "paddle/fluid/distributed/collective/process_group_nccl.h"
+
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
 #endif
@@ -301,5 +304,12 @@ public:
 
     void low_latency_clean_mask_buffer();
 };
+
+inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
+                                            phi::GPUContext* ctx) {
+  ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
+                        .GetAllocator(ctx->GetPlace(), stream)
+                        .get());
+}
 
 }  // namespace deep_ep

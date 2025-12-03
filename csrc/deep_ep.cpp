@@ -416,7 +416,7 @@ Buffer::get_dispatch_layout(
     auto compute_stream = calc_ctx->stream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -465,7 +465,7 @@ Buffer::get_dispatch_layout(
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
 
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
 }
@@ -577,7 +577,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto compute_stream = calc_ctx->stream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        at::cuda::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -767,7 +767,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Switch back compute stream
     if (allocate_on_comm_stream) {
-        at::cuda::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
     }
 
     // Return values
@@ -822,7 +822,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     auto compute_stream = calc_ctx->stream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        at::cuda::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -920,7 +920,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Switch back compute stream
     if (allocate_on_comm_stream) {
-        at::cuda::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
     }
 
     return {recv_x, recv_topk_weights, event};
@@ -1059,7 +1059,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto compute_stream = calc_ctx->stream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        at::cuda::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1299,7 +1299,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Switch back compute stream
     if (allocate_on_comm_stream) {
-        at::cuda::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
     }
 
     // Return values
@@ -1377,7 +1377,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     auto compute_stream = calc_ctx->stream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        at::cuda::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1502,7 +1502,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Switch back compute stream
     if (allocate_on_comm_stream) {
-        at::cuda::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
     }
 
     // Return values
