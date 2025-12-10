@@ -1,4 +1,28 @@
-# DeepEP
+# DeepEP ❤️ PaddlePaddle
+
+> [!NOTE]
+>
+> This repo is a fork of the original DeepEP project, with modifications to enhance compatibility and integration with PaddlePaddle.
+>
+> **Installation**
+>
+> ```bash
+> pip install paddlepaddle-gpu  # Install PaddlePaddle with GPU support, refer to https://www.paddlepaddle.org.cn/install/quick for more details
+> git clone https://github.com/PFCCLab/DeepEP.git
+> cd DeepEP
+> NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
+> ```
+>
+> **Usage**
+>
+> ```python
+> import paddle
+> paddle.compat.enable_torch_proxy(scope={"deep_ep"})  # Enable torch proxy before importing deep_ep
+> import deep_ep
+> # use deep_ep
+> ```
+The original README.md content is as follows:
+---
 
 DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
 
