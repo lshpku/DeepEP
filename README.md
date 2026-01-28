@@ -21,7 +21,29 @@
 > import deep_ep
 > # use deep_ep
 > ```
+>
+> **Use with PaddleFleet**
+>
+> DeepEP already integrates with PaddleFleet. You can install PaddleFleet pre-built wheel from our self-hosted index:
+>
+> ```bash
+> # For CUDA 12.9
+> pip install paddlefleet -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+> # For CUDA 13.0
+> pip install paddlefleet -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
+> ```
+>
+> All indexes are available at https://www.paddlepaddle.org.cn/install/quick
+>
+> Then, you can use DeepEP in PaddleFleet as follows:
+>
+> ```python
+> from paddlefleet.ops import deep_ep
+> # use deep_ep
+> ```
+
 The original README.md content is as follows:
+
 ---
 
 DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
@@ -39,7 +61,7 @@ Notice: the implementation in this library may have some slight differences from
 We test normal kernels on H800 (~160 GB/s NVLink maximum bandwidth), with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow the DeepSeek-V3/R1 pretraining setting (4096 tokens per batch, 7168 hidden, top-4 groups, top-8 experts, FP8 dispatching and BF16 combining).
 
 |   Type    | Dispatch #EP | Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-|:---------:|:------------:|:--------------------:|:-----------:|:--------------------:|
+| :-------: | :----------: | :------------------: | :---------: | :------------------: |
 | Intranode |      8       |  153 GB/s (NVLink)   |      8      |  158 GB/s (NVLink)   |
 | Internode |      16      |    43 GB/s (RDMA)    |     16      |    43 GB/s (RDMA)    |
 | Internode |      32      |    58 GB/s (RDMA)    |     32      |    57 GB/s (RDMA)    |
@@ -52,7 +74,7 @@ We test normal kernels on H800 (~160 GB/s NVLink maximum bandwidth), with each c
 We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow a typical DeepSeek-V3/R1 production setting (128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining).
 
 | Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-|:------------:|:-------:|:--------------:|:-----------:|:-------:|:--------------:|
+| :----------: | :-----: | :------------: | :---------: | :-----: | :------------: |
 |      8       |  77 us  |    98 GB/s     |      8      | 114 us  |    127 GB/s    |
 |      16      | 118 us  |    63 GB/s     |     16      | 195 us  |    74 GB/s     |
 |      32      | 155 us  |    48 GB/s     |     32      | 273 us  |    53 GB/s     |
