@@ -85,11 +85,10 @@ private:
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
-    // Stream for communication
-    std::optional<at::cuda::CUDAStream> comm_stream;
-
-    phi::distributed::NCCLCommContext* comm_ctx;
-    phi::GPUContext* calc_ctx;
+    phi::distributed::NCCLCommContext* comm_ctx = nullptr;
+    phi::GPUContext* calc_ctx = nullptr;
+    // Declared after the contexts because its constructor lambda assigns them.
+    at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -151,15 +150,10 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    at::cuda::CUDAStream get_comm_stream() const {
-        return comm_stream.value();
+    torch::Stream get_comm_stream() const {
+        return comm_stream;
     }
     
-    // Helper to get raw stream for CUDA APIs
-    cudaStream_t get_comm_stream_raw() const {
-        return comm_stream.value().stream();
-    }
-
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
@@ -320,17 +314,6 @@ inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
   ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
                         .GetAllocator(ctx->GetPlace(), stream)
                         .get());
-}
-
-// Helper to create CUDAStream from raw cudaStream_t
-inline at::cuda::CUDAStream make_cuda_stream(cudaStream_t raw_stream, int device_id = -1) {
-    if (device_id == -1) {
-        CUDA_CHECK(cudaGetDevice(&device_id));
-    }
-    c10::StreamId sid = static_cast<c10::StreamId>(reinterpret_cast<intptr_t>(raw_stream));
-    return at::cuda::CUDAStream(c10::Stream(c10::Stream::UNSAFE,
-                                            c10::Device(c10::DeviceType::CUDA, device_id),
-                                            sid));
 }
 
 }  // namespace deep_ep
