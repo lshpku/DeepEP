@@ -478,7 +478,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens,
              int rank,
-             int num_ranks) {
+             int num_ranks,
+             int4* unzipped_x,
+             float* unzipped_probs,
+             int* unzipped_expert_counter,
+             const int* unzipped_expert_offset) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -1057,8 +1061,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         // NVL consumers
         // Retrieve rank offset from barrier results (each lane's register stores an RDMA rank)
         int src_nvl_rank = target_rank, total_offset = 0;
-        const int local_expert_begin = rank * (num_experts / num_ranks);
-        const int local_expert_end = local_expert_begin + (num_experts / num_ranks);
+        const int num_local_experts = num_experts / num_ranks;
+        const int local_expert_begin = rank * num_local_experts;
+        const int local_expert_end = local_expert_begin + num_local_experts;
+
+        // Cache each local expert's base offset in `unzipped_x` (fused unzip), one lane per expert
+        int cached_unzip_offset = 0;
+        if (unzipped_x != nullptr) {
+            EP_DEVICE_ASSERT(num_local_experts <= 32);
+            cached_unzip_offset = lane_id < num_local_experts ? ld_nc_global(unzipped_expert_offset + lane_id) : 0;
+        }
 
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
         if (lane_id < kNumRDMARanks and lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank > 0)
@@ -1166,6 +1178,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 shifted += sizeof(SourceMeta);
 
                 // Copy `topk_idx` and `topk_weights`
+                int local_expert_idx = -1;
+                float local_expert_prob = 0.0f;
                 if (lane_id < num_topk) {
                     // Read
                     auto idx_value = static_cast<topk_idx_t>(ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id));
@@ -1177,6 +1191,36 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     weight_value = idx_value >= 0 ? weight_value : 0.0f;
                     st_na_global(recv_topk_idx + recv_idx, idx_value);
                     st_na_global(recv_topk_weights + recv_idx, weight_value);
+
+                    local_expert_idx = static_cast<int>(idx_value);
+                    local_expert_prob = weight_value;
+                }
+
+                // Multicast the token into each of its local experts' region of `unzipped_x` (fused unzip)
+                // NOTES: the slot inside a region is grabbed atomically, so the order is non-deterministic
+                if (unzipped_x != nullptr) {
+                    // Every hit lane grabs its own slot in parallel, so the warp pays a single atomic
+                    // round-trip per token instead of one per (token, expert) pair
+                    // NOTES: a token never selects the same expert twice, so the lanes never collide here
+                    auto expert_offset = __shfl_sync(0xffffffff, cached_unzip_offset, max(local_expert_idx, 0));
+                    int64_t unzipped_idx = 0;
+                    if (local_expert_idx >= 0) {
+                        auto slot = atomicAdd(unzipped_expert_counter + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
+                        unzipped_idx = static_cast<int64_t>(expert_offset) + slot;
+                        st_na_global(unzipped_probs + unzipped_idx, local_expert_prob);
+                    }
+
+                    // Issue the copies from a single lane, as the source is the whole warp's TMA buffer
+                    auto expert_mask = __ballot_sync(0xffffffff, local_expert_idx >= 0);
+                    while (expert_mask != 0) {
+                        auto src_lane = __ffs(static_cast<int>(expert_mask)) - 1;
+                        expert_mask &= expert_mask - 1;
+
+                        auto dst_idx = __shfl_sync(0xffffffff, unzipped_idx, src_lane);
+                        if (elect_one_sync())
+                            tma_store_1d(tma_buffer, unzipped_x + dst_idx * hidden_int4, hidden_bytes, false);
+                    }
+                    __syncwarp();
                 }
 
                 // Wait TMA to be finished
@@ -1244,7 +1288,11 @@ void dispatch(void* recv_x,
               bool is_cached_dispatch,
               cudaStream_t stream,
               int num_channels,
-              bool low_latency_mode) {
+              bool low_latency_mode,
+              void* unzipped_x,
+              float* unzipped_probs,
+              int* unzipped_expert_counter,
+              const int* unzipped_expert_offset) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1295,7 +1343,11 @@ void dispatch(void* recv_x,
                       num_max_nvl_chunked_send_tokens,                                                                         \
                       num_max_nvl_chunked_recv_tokens,                                                                         \
                       rank,                                                                                                    \
-                      num_ranks);                                                                                              \
+                      num_ranks,                                                                                               \
+                      reinterpret_cast<int4*>(unzipped_x),                                                                     \
+                      unzipped_probs,                                                                                          \
+                      unzipped_expert_counter,                                                                                 \
+                      unzipped_expert_offset);                                                                                 \
     }                                                                                                                          \
     break
 

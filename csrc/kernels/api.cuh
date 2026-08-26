@@ -212,7 +212,11 @@ void dispatch(void* recv_x,
               bool is_cached_dispatch,
               cudaStream_t stream,
               int num_channels,
-              bool low_latency_mode);
+              bool low_latency_mode,
+              void* unzipped_x = nullptr,
+              float* unzipped_probs = nullptr,
+              int* unzipped_expert_counter = nullptr,
+              const int* unzipped_expert_offset = nullptr);
 
 void cached_notify(int hidden_int4,
                    int num_scales,

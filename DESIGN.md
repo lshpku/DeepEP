@@ -18,7 +18,8 @@
 首先说明一个 chunk 的概念，这是本方案中最重要的概念之一：
   * 我们知道，dispatch 本来收到 token 的顺序是不固定的，在通信底层看来，可能先收到这个专家或那个专家，可能先收到这个 channel 或那个 channel
   * 但是，站在专家消费者的角度看，其实 token 到达就像“细水长流”，当前专家的 buffer 不停地有 token 进来，专家只要不断“消费”它们就好了
-  * 因此，我们可以把 unzip 融合到 dispatch 里，dispatch 一边收 token 一边转发（append）到各个专家的 buffer，每个专家凑够 chunk 个 token 后，就可以开始一次 FFN 计算，chunk 的意义在于保证计算密度，如果每来一个 token 就计算，矩阵乘很难打满
+  * 因此，我们可以把 unzip 融合到 dispatch 里，dispatch 一边收 token 一边转发（append）到各个专家的 buffer，每个专家凑够 chunk 个 token 后，就可以开始一次 FFN 计算
+  * chunk 的意义在于保证计算密度，如果每来一个 token 就计算，矩阵乘很难打满；根据矩阵乘硬件要求，chunk 应当是 128 的倍数，根据之前调试 subbatch 的经验，chunk 至少为 2048-4096 才是足够的
   * 当前我们使用的的 DeepGEMM 提供了一个很好的特性，就是 token 的位置无关性，token 不管在 buffer 的哪里，FFN 算出来的结果都是一样的，因此专家 buffer 不需要保持和 DeepEP 一样的顺序，而是可以 atomic 地先到先放置，只要最后 combine 前再恢复到 DeepEP 的顺序即可
 
 新方案的一次前向过程即可描述如下：
@@ -78,10 +79,12 @@ dispatch 原有的主要输出为：
 `recv_token_indices`[num_recv_tokens, topk] int64: 收到的 token 属于本地哪些专家（最少1个，最多topk个，使用本地专家下标，无效部分用-1填充，未排序）
 `recv_token_probs`[num_recv_tokens, topk] float32: 和 indices 一一对应的每个 token 对于每个专家的权重
 
-融合了 unzip 后，dispatch 实际上需要同时给出原有 unzip 的输出，里面每个专家的 token 连续排列，即前 tokens_per_expert[0] 个 token 是专家0的，**向128对齐后**，接下来的 tokens_per_expert[1] 个 token 是专家1的，以此类推
+融合了 unzip 后，dispatch 给计算的则是 unzip 的输出，里面每个专家的 token 连续排列，即前 tokens_per_expert[0] 个 token 是专家0的，**向128对齐后**，接下来的 tokens_per_expert[1] 个 token 是专家1的，以此类推
 但是与原有 unzip 不同的是，原来 unzip 输出的 token 顺序是确定性的，而现在新的是非确定的，每个专家的段内是 atomic 先到先放，往前压实
 * `unzipped_tokens`[num_unzipped_tokens, hidden_size] bf16
 * `unzipped_probs`[num_unzipped_tokens] fp32
+
+注：融合 unzip 之后，dispatch 原有的 recv_tokens 依然是要写的，反向要用
 
 之后，上述两个变量就会给到计算部分进行计算，计算过程的 buffer 如下，在各 buffer 中 token 的位置都是不变的，都向 unzipped_tokens 对齐，其实 o1/o2 我们不用管，只看 o3 就行
 * `o1`[num_unzipped_tokens, 2*intermediate_size] bf16 : gateup 的输出
@@ -98,7 +101,7 @@ zip 需要监控 o3 的完成情况，当一个 token 在 o3 里面已经被所�
 
 dispatch 需要给到计算的除了 unzipped_tokens 和 unzipped_probs，还有一个任务队列：
 `task_queue`[num_chunks, 4] int32 : 记录每个 chunk 的描述符和就绪信号，格式为 [expert_idx, m_start, m_size, ready]
-* num_chunks 是可以提前算出来的，因为 dispatch 开始前就已经知道 tokens_per_expert，则 num_chunks = sum(ceil(n // chunk) for n in tokens_per_expert)
+* num_chunks 是可以提前算出来的，因为 dispatch 开始前就已经知道 tokens_per_expert，则 num_chunks = sum(ceil(n / chunk) for n in tokens_per_expert)
 * expert_idx 是该 chunk 属于哪个本地专家
 * m_start 是该 chunk 在 unzipped_tokens 里的偏移 token 数
 * m_size 是 chunk 包含的 token 数，一般为 chunk 大小，但对于一个专家的余数部分是可以小于 chunk 大小的，计算侧已经做了动态 M 的适配

@@ -113,6 +113,9 @@ private:
     volatile int* moe_recv_expert_counter = nullptr;
     int* moe_recv_expert_counter_mapped = nullptr;
 
+    // Host-side staging buffer for the fused-unzip per-expert base offsets (pinned, for async H2D)
+    int* unzip_expert_offset_host = nullptr;
+
     // Host-side RDMA-level MoE info
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
@@ -225,6 +228,8 @@ public:
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     internode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
@@ -245,7 +250,8 @@ public:
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
-                       bool allocate_on_comm_stream);
+                       bool allocate_on_comm_stream,
+                       int unzip_alignment = 0);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
         const torch::Tensor& x,

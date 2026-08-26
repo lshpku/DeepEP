@@ -220,6 +220,9 @@ Buffer::Buffer(int rank,
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
+    // Fused-unzip per-expert base offsets (pinned, so the H2D copy can stay async)
+    CUDA_CHECK(cudaMallocHost(&unzip_expert_offset_host, sizeof(int) * NUM_MAX_LOCAL_EXPERTS));
+
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
         CUDA_CHECK(cudaMallocHost(&moe_recv_rdma_counter, sizeof(int), cudaHostAllocMapped));
@@ -328,6 +331,7 @@ void Buffer::destroy() {
 
     // Free chunked mode staffs
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
+    CUDA_CHECK(cudaFreeHost(unzip_expert_offset_host));
 
     destroyed = true;
     available = false;
@@ -948,6 +952,8 @@ std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -968,7 +974,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
-                           bool allocate_on_comm_stream) {
+                           bool allocate_on_comm_stream,
+                           int unzip_alignment) {
 #ifndef DISABLE_NVSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1223,6 +1230,39 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
     }
 
+    // Allocate the fused-unzip outputs
+    // NOTES: each local expert owns a `unzip_alignment`-aligned region of `unzipped_x`, and the receivers
+    // atomically grab slots inside it, so the intra-region order is non-deterministic
+    auto unzipped_x = std::optional<torch::Tensor>();
+    auto unzipped_probs = std::optional<torch::Tensor>();
+    auto unzipped_expert_counter = std::optional<torch::Tensor>();
+    auto unzipped_expert_offset = std::optional<torch::Tensor>();
+    if (unzip_alignment > 0) {
+        EP_HOST_ASSERT(not cached_mode and num_worst_tokens == 0);
+        EP_HOST_ASSERT(topk_idx.has_value());
+        EP_HOST_ASSERT(num_local_experts <= 32);
+
+        int num_unzipped_tokens = 0;
+        for (int i = 0; i < num_local_experts; ++i) {
+            unzip_expert_offset_host[i] = num_unzipped_tokens;
+            num_unzipped_tokens += (num_recv_tokens_per_expert_list[i] + unzip_alignment - 1) / unzip_alignment * unzip_alignment;
+        }
+
+        unzipped_x = torch::empty({num_unzipped_tokens, hidden}, x.options());
+        unzipped_probs = torch::empty({num_unzipped_tokens}, dtype(torch::kFloat32).device(torch::kCUDA));
+        unzipped_expert_offset = torch::empty({num_local_experts}, dtype(torch::kInt32).device(torch::kCUDA));
+
+        // NOTES: the counters are strided so that they do not share cache lines
+        auto num_counter_ints = num_local_experts * NUM_UNZIP_COUNTER_STRIDE;
+        unzipped_expert_counter = torch::empty({num_counter_ints}, dtype(torch::kInt32).device(torch::kCUDA));
+        CUDA_CHECK(cudaMemsetAsync(unzipped_expert_counter->data_ptr<int>(), 0, sizeof(int) * num_counter_ints, comm_stream));
+        CUDA_CHECK(cudaMemcpyAsync(unzipped_expert_offset->data_ptr<int>(),
+                                   unzip_expert_offset_host,
+                                   sizeof(int) * num_local_experts,
+                                   cudaMemcpyHostToDevice,
+                                   comm_stream));
+    }
+
     // Launch data dispatch
     // NOTES: the buffer size checks are moved into the `.cu` file
     internode::dispatch(recv_x.data_ptr(),
@@ -1262,7 +1302,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         cached_mode,
                         comm_stream,
                         num_channels,
-                        low_latency_mode);
+                        low_latency_mode,
+                        unzipped_x.has_value() ? unzipped_x->data_ptr() : nullptr,
+                        unzipped_probs.has_value() ? unzipped_probs->data_ptr<float>() : nullptr,
+                        unzipped_expert_counter.has_value() ? unzipped_expert_counter->data_ptr<int>() : nullptr,
+                        unzipped_expert_offset.has_value() ? unzipped_expert_offset->data_ptr<int>() : nullptr);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1296,7 +1340,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                          recv_gbl_channel_prefix_matrix,
                          send_rdma_head,
                          send_nvl_head,
-                         recv_src_meta}) {
+                         recv_src_meta,
+                         unzipped_x,
+                         unzipped_probs}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
@@ -1325,6 +1371,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             recv_src_meta,
             send_rdma_head,
             send_nvl_head,
+            unzipped_x,
+            unzipped_probs,
             event};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
