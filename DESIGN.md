@@ -101,22 +101,27 @@ zip 需要监控 o3 的完成情况，当一个 token 在 o3 里面已经被所�
 由于目前通信和计算在并行开发，目前已经约定了一部分 buffer 和信号的规范，剩下还没约定的可以先不纠结，会走一步看一步
 
 dispatch 需要给到计算的除了 unzipped_tokens 和 unzipped_probs，还有一个任务队列：
-`task_queue`[num_chunks, 4] int32 : 记录每个 chunk 的描述符和就绪信号，格式为 [expert_idx, m_start, m_size, ready]
+`task_queue`[num_chunks, 4] int32 : 记录每个 chunk 的描述符和就绪信号，格式为 [expert_idx, m_start, m_size, ready]，使用 atomic 竞争下标并依次写入（随机顺序）
 * num_chunks 是可以提前算出来的，因为 dispatch 开始前就已经知道 tokens_per_expert，则 num_chunks = sum(ceil(n / chunk) for n in tokens_per_expert)
 * expert_idx 是该 chunk 属于哪个本地专家
 * m_start 是该 chunk 在 unzipped_tokens 里的偏移 token 数
 * m_size 是 chunk 包含的 token 数，一般为 chunk 大小，但对于一个专家的余数部分是可以小于 chunk 大小的，计算侧已经做了动态 M 的适配
 * 该 buffer 初始化为全 0，使用 push 的形式，每有一个专家凑够一个 chunk 就往里 push，通信侧需要自己记录 push 到哪个下标了，但不需要让计算知道，因为计算 kernel 是靠 ready 信号判断的，不需要知道你 push 到第几个下标了
 
-另外，需要两个映射表用于前向 atomic 序和 DeepEP 序之间的转换，这两张表都是随着 receiver 更新，收到 token 后才赋值，当然信号机制会保证它们的消费者会在赋值后才读
+另外，需要两个映射表用于前向 atomic 序和 DeepEP 序之间的转换，这两张表都是随着 receiver 更新，收到 token 后才赋值，当然信号机制会保证消费者在读到 ready 信号时才会访问对应的值：
 `atomic_to_zip`[num_unzipped_tokens] int32 : 使用 atomic 序，记录一个 token 指向 DeepEP 序里的哪个下标，padding 位置填 -1
 `zip_to_atomic`[num_recv_tokens, topk] int32 : 使用 DeepEP 序，位置和 recv_token_indices 一一对应，记录对于每个有效的 token，zip 的时候应该去 o3 的哪个下标读，无效位置填 -1
 
-计算那边给到我们的则是一个任务完成计数表，记录每个 token 被几个专家完成了：
-`task_done`[num_recv_tokens] int32 : 使用 DeepEP 序，当一个 token 的计数等于它在本机上的有效 topk 数时，说明它被所有专家计算完了，就可以进行 zip 了
+为了让计算侧知道每个 token 的有效 topk 数，dispatch 还会给一张计数表，同样是随 ready 动态更新的：
+`num_valid_topk`[num_recv_tokens] int32 : 使用 DeepEP 序，记录每个 token 在本地有几个专家，其值等价于**通信完成后** recv_token_indices 里面每行非 -1 的和，但是在运行时不相等，因为 recv_token_indices 的一行是分专家更新的，一个 chunk 就绪时只保证这个 chunk 所属专家在 recv_token_indices 里面的槽位就绪，不保证这一行所有专家都就绪，导致数少了；num_valid_topk 则是通过冗余更新解决这个问题，一个 token 的每个专家的 chunk 发布时都会重新写一次 topk 值；保险起见，num_valid_topk 初始化为 0，如果计算侧读到 0 则认为出错
+
+计算那边给到我们的则是一个 token 完成队列，记录可以进行 zip 的 token 下标：
+`zip_task_queue`[num_recv_tokens] int32 : 和 task_queue 类似使用 atomic 竞争入队，内容为计算完的 token 在 DeepEP 序中的下标；计算侧会计数每个 token 被多少个专家完成了，当完成的次数等于 num_valid_topk 里的值时，该 token 就会被 push 进来；该队列初始化为全 -1，这样当读到非 -1 时就知道就绪了，不需要额外 ready 信号；zip 从头开始连续扫描，遇到 -1 则等待，不可跳过
+
+说明：计算侧使用了非常暴力的同步保证，计算侧对每个 chunk 都 launch 了一个独立的 gemm kernel，gemm 完成后也不由自己更新 zip_task_queue，而是又启动一个 kernel 来更新计数器和入队 zip_task_queue，因此 zip 读到任务时 token 一定已经写入 o3
 
 zip 和 combine 之间还有一个信号，记录每个 token 是否可以被 combine：
-`zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示即可
+`zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示即可；combine 时每个 channel 的 sender 仍然按原来的顺序进行发送，但是当一个 token 未就绪时需要等待，不可跳过
 
 
 ### 任务入队机制

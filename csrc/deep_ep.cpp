@@ -957,6 +957,7 @@ std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -1243,6 +1244,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto unzip_expert_meta = std::optional<torch::Tensor>();
     auto atomic_to_zip = std::optional<torch::Tensor>();
     auto zip_to_atomic = std::optional<torch::Tensor>();
+    auto num_valid_topk = std::optional<torch::Tensor>();
     auto unzip_chunk_done = std::optional<torch::Tensor>();
     auto task_queue = std::optional<torch::Tensor>();
     auto task_queue_counter = std::optional<torch::Tensor>();
@@ -1275,6 +1277,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         CUDA_CHECK(cudaMemsetAsync(atomic_to_zip->data_ptr<int>(), 0xff, sizeof(int) * num_unzipped_tokens, comm_stream));
         CUDA_CHECK(
             cudaMemsetAsync(zip_to_atomic->data_ptr<int>(), 0xff, sizeof(int) * num_recv_tokens * num_topk, comm_stream));
+
+        // Normally, the consumer should not read a slot in num_valid_topk before it is assigned by
+        // receiver. As a safety guard, we zero it so that reading a zero value means a bug
+        num_valid_topk = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
+        CUDA_CHECK(cudaMemsetAsync(num_valid_topk->data_ptr<int>(), 0, sizeof(int) * num_recv_tokens, comm_stream));
 
         // NOTES: the slot counters are strided so that they do not share cache lines
         auto num_counter_ints = num_local_experts * NUM_UNZIP_COUNTER_STRIDE;
@@ -1339,6 +1346,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         unzip_expert_meta.has_value() ? unzip_expert_meta->data_ptr<int>() : nullptr,
                         atomic_to_zip.has_value() ? atomic_to_zip->data_ptr<int>() : nullptr,
                         zip_to_atomic.has_value() ? zip_to_atomic->data_ptr<int>() : nullptr,
+                        num_valid_topk.has_value() ? num_valid_topk->data_ptr<int>() : nullptr,
                         unzip_chunk_done.has_value() ? unzip_chunk_done->data_ptr<int>() : nullptr,
                         task_queue.has_value() ? task_queue->data_ptr<int>() : nullptr,
                         task_queue_counter.has_value() ? task_queue_counter->data_ptr<int>() : nullptr,
@@ -1381,6 +1389,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                          unzipped_probs,
                          atomic_to_zip,
                          zip_to_atomic,
+                         num_valid_topk,
                          task_queue}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
@@ -1414,6 +1423,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             unzipped_probs,
             atomic_to_zip,
             zip_to_atomic,
+            num_valid_topk,
             task_queue,
             event};
 #else

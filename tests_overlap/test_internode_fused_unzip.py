@@ -218,6 +218,28 @@ def check_task_queue(tokens_per_expert, task_queue):
     return ok
 
 
+def check_num_valid_topk(recv_token_indices, num_valid_topk):
+    """
+    num_valid_topk 校验: 通信全部完成后, 它必须等于 recv_token_indices 每行非 -1 的个数,
+    且每个 token 至少命中一个本地专家(即不能有 0, 0 是初值).
+    """
+    expected = (recv_token_indices >= 0).astype("int32").sum(-1).astype("int32")
+    actual = num_valid_topk.astype("int32")
+
+    ok = True
+    num_bad = int((actual != expected).astype("int32").sum())
+    if num_bad != 0:
+        ok = False
+        print(f"  num_valid_topk 与 recv_token_indices 的行计数不符, {num_bad} 个 token")
+    num_zero = int((actual == 0).astype("int32").sum())
+    if num_zero != 0:
+        ok = False
+        print(f"  num_valid_topk 有 {num_zero} 个 token 仍是初值 0, 说明它没被写过")
+
+    print("num_valid_topk check:", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     group = initialize_fleet()
     configure_buffer(NUM_SMS)
@@ -228,7 +250,7 @@ def main():
     run_dispatch(group, buffer, x, token_probs, token_indices, 0)
 
     recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, _, _, \
-        unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, task_queue = \
+        unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue = \
         run_dispatch(group, buffer, x, token_probs, token_indices, ALIGNMENT)
 
     print("num_recv_tokens:", recv_x.shape[0], "tokens_per_expert:", tokens_per_expert)
@@ -247,6 +269,7 @@ def main():
         recv_x, recv_token_indices, tokens_per_expert, unzipped_tokens, atomic_to_zip, zip_to_atomic
     )
     check_task_queue(tokens_per_expert, task_queue)
+    check_num_valid_topk(recv_token_indices, num_valid_topk)
 
     ############################### PERF COMPARE ###############################
 

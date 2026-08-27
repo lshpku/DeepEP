@@ -485,6 +485,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              const int* unzip_expert_meta,
              int* atomic_to_zip,
              int* zip_to_atomic,
+             int* num_valid_topk,
              int* unzip_chunk_done,
              int* task_queue,
              int* task_queue_counter,
@@ -1216,6 +1217,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     auto expert_count = __shfl_sync(0xffffffff, cached_unzip_count, meta_lane);
                     auto expert_chunk_base = __shfl_sync(0xffffffff, cached_unzip_chunk_base, meta_lane);
 
+                    // How many local experts this token hits
+                    auto num_hits = __popc(__ballot_sync(0xffffffff, local_expert_idx >= 0));
+
                     // Every hit lane issues its own copy, so the warp pays a single atomic round-trip
                     // per token and each lane's completion wait covers exactly its own copy
                     // NOTES: a token never selects the same expert twice, so the lanes never collide
@@ -1227,6 +1231,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         st_na_global(unzipped_probs + unzipped_idx, local_expert_prob);
                         st_na_global(atomic_to_zip + unzipped_idx, static_cast<int>(recv_token_idx));
                         st_na_global(zip_to_atomic + recv_token_idx * num_topk + lane_id, static_cast<int>(unzipped_idx));
+
+                        // Every hit lane writes the same value to the same address, so that whichever
+                        // of this token's chunks becomes ready first already carries the count
+                        st_na_global(num_valid_topk + recv_token_idx, num_hits);
 
                         // Wait for our own copy to land, so that the release below has something
                         // complete to publish
@@ -1334,6 +1342,7 @@ void dispatch(void* recv_x,
               const int* unzip_expert_meta,
               int* atomic_to_zip,
               int* zip_to_atomic,
+              int* num_valid_topk,
               int* unzip_chunk_done,
               int* task_queue,
               int* task_queue_counter,
@@ -1395,6 +1404,7 @@ void dispatch(void* recv_x,
                       unzip_expert_meta,                                                                                       \
                       atomic_to_zip,                                                                                           \
                       zip_to_atomic,                                                                                           \
+                      num_valid_topk,                                                                                          \
                       unzip_chunk_done,                                                                                        \
                       task_queue,                                                                                              \
                       task_queue_counter,                                                                                      \
