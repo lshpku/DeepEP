@@ -216,7 +216,13 @@ void dispatch(void* recv_x,
               void* unzipped_x = nullptr,
               float* unzipped_probs = nullptr,
               int* unzipped_expert_counter = nullptr,
-              const int* unzipped_expert_offset = nullptr);
+              const int* unzip_expert_meta = nullptr,
+              int* atomic_to_zip = nullptr,
+              int* zip_to_atomic = nullptr,
+              int* unzip_chunk_done = nullptr,
+              int* task_queue = nullptr,
+              int* task_queue_counter = nullptr,
+              int unzip_chunk_size = 0);
 
 void cached_notify(int hidden_int4,
                    int num_scales,

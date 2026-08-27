@@ -95,6 +95,7 @@ zip 需要监控 o3 的完成情况，当一个 token 在 o3 里面已经被所�
 该 buffer 的顺序恢复到原来确定性的 DeepEP 的顺序，因此 zip 需要负责从 atomic 序到 DeepEP 序的转换
 * `combine_input`[num_recv_tokens, hidden_size] bf16
 
+
 ### 信号设计
 
 由于目前通信和计算在并行开发，目前已经约定了一部分 buffer 和信号的规范，剩下还没约定的可以先不纠结，会走一步看一步
@@ -107,8 +108,9 @@ dispatch 需要给到计算的除了 unzipped_tokens 和 unzipped_probs，还有
 * m_size 是 chunk 包含的 token 数，一般为 chunk 大小，但对于一个专家的余数部分是可以小于 chunk 大小的，计算侧已经做了动态 M 的适配
 * 该 buffer 初始化为全 0，使用 push 的形式，每有一个专家凑够一个 chunk 就往里 push，通信侧需要自己记录 push 到哪个下标了，但不需要让计算知道，因为计算 kernel 是靠 ready 信号判断的，不需要知道你 push 到第几个下标了
 
-另外，需要给一个映射表用于前向 atomic 序到 DeepEP 序的转换，这张表和 unzipped_tokens 同步更新，也就是里面的内容不是一开始就有效的，是收到 token 后才赋值
-`atomic_to_zip`[num_unzipped_tokens] int32 : 使用前向 atomic 序，记录一个 token 指向 DeepEP 序里的哪个下标
+另外，需要两个映射表用于前向 atomic 序和 DeepEP 序之间的转换，这两张表都是随着 receiver 更新，收到 token 后才赋值，当然信号机制会保证它们的消费者会在赋值后才读
+`atomic_to_zip`[num_unzipped_tokens] int32 : 使用 atomic 序，记录一个 token 指向 DeepEP 序里的哪个下标，padding 位置填 -1
+`zip_to_atomic`[num_recv_tokens, topk] int32 : 使用 DeepEP 序，位置和 recv_token_indices 一一对应，记录对于每个有效的 token，zip 的时候应该去 o3 的哪个下标读，无效位置填 -1
 
 计算那边给到我们的则是一个任务完成计数表，记录每个 token 被几个专家完成了：
 `task_done`[num_recv_tokens] int32 : 使用 DeepEP 序，当一个 token 的计数等于它在本机上的有效 topk 数时，说明它被所有专家计算完了，就可以进行 zip 了
@@ -117,8 +119,20 @@ zip 和 combine 之间还有一个信号，记录每个 token 是否可以被 co
 `zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示即可
 
 
+### 任务入队机制
+
+这里需要单独用一节说明 chunk 任务入队的逻辑，这对正确性和性能都非常关键，开发者必须充分理解
+
+首先明确一点，<b>一个 chunk 的最后一个下标的 token 完成写入</b> 不等于 <b>这个 chunk 里所有 token 都已写入</b>，因为 chunk 里的 token 是由很多的 receiver warp 并发写的，一个 warp 恰好负责最后一个下标的 token 只是说明它在 atomic 时抢到了这个 slot 下标，不代表它前面的 token 一定先于它写入
+
+因此，写入下标和写完成必须分开计数，用`unzipped_expert_counter [num_experts] int32`来抢 slot 下标，用`unzip_chunk_done [num_chunks] int32`来记录写入完成，后者是 chunk 级别的计数，记录当前 chunk 中已经**完成写入**多少个 token，当写入数量恰好等于这个 chunk 的预期大小时，就可以入队这个 chunk
+
+然而，这里就有个一个性能瓶颈，因为 unzip_chunk_done 必须等 token 写入并同步（release）才能更新，这个 release 信号的延迟很高，要等到一个 token（例如 8KB 级别）传到 L2 同步点才能完成，导致 receiver 等待时间变得很长；注意这里不是说 release 导致了更高的带宽占用，只是增加了 receiver 延迟，导致整个通信链条被阻塞
+
+目前暂时保证了功能正确，后续性能优化的方向就是怎么让它隐藏这个延迟，例如使用更粗粒度的 release，写多个 token 才同步一次，这个可以到功能全部跑通后再做
+
+
+### Miscs
+
 现在该工程还处在一个初步阶段，很多细节还没定，比如 dispatch 如何高效地发布任务，zip 如何高效地扫描完成的 token，这些都是需要走一步看一步的，我也没打算一次性想明白
 我希望用一个增量式的开发思路，每次增加一个功能，验证性能，看看在原版 DeepEP 上增加东西后对性能的影响，这样尽量让所有的修改对性能的影响都可控，不要一次性都开发完了发现性能很差
-
-
-注：我们需要保证我们的 acquire/release 语义正确，因为这是一个跨 stream 场景，需要使用适当的访存指令后缀

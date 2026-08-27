@@ -89,6 +89,16 @@ __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
     asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
 
+// A release-ordered `atomicAdd`, i.e. the caller's prior writes are visible before the counter is.
+// NOTES: measured to be no faster than `__threadfence()` + a relaxed `atomicAdd` in the fused-unzip
+// receiver, since the cost there is the exposed L2 drain that both forms have to pay; it is used
+// because expressing the ordering as one release op is tighter, not because it is cheaper
+__device__ __forceinline__ int atomic_add_release_gpu(const int* ptr, int val) {
+    int ret;
+    asm volatile("atom.release.gpu.global.add.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(val) : "memory");
+    return ret;
+}
+
 __device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
@@ -412,6 +422,17 @@ __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* g
 template <int N>
 __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
+}
+
+// Unlike `tma_store_wait`, this waits for the copies to actually complete instead of just for the
+// smem source to be released, i.e. the writes have landed and are visible to the executing thread.
+// NOTES: per the PTX ISA, completion of a bulk async operation is followed by an implicit
+// generic-async proxy fence, so no explicit `fence.proxy.async` is needed here. This is still only
+// visibility to the *executing thread*, so publishing to other threads additionally needs a release
+// at the right scope (see `atomic_add_release_gpu`)
+template <int N>
+__device__ __forceinline__ void tma_store_wait_complete() {
+    asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
 
 #endif

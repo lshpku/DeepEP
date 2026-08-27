@@ -332,7 +332,8 @@ class Buffer:
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                  allocate_on_comm_stream: bool = False,
                  skip_x_record_stream: bool = False,
-                 unzip_alignment: int = 0) -> \
+                 unzip_alignment: int = 0,
+                 unzip_chunk_size: int = 0) -> \
                  Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                     Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -377,6 +378,9 @@ class Buffer:
                 (internode only). `unzip` is fused into dispatch, so each local expert's region of
                 `unzipped_tokens` is filled by atomically grabbed slots and its intra-region order is
                 non-deterministic. Regions are aligned to `unzip_alignment` and the padding rows are garbage.
+            atomic_to_zip, zip_to_atomic, task_queue: also only appended when `unzip_alignment > 0`, see
+                DESIGN.md. `task_queue` is `[num_chunks, 4]` with `[expert_idx, m_start, m_size, ready]`,
+                pushed in FIFO order by whichever warp happens to complete a chunk last.
         """
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
@@ -385,7 +389,7 @@ class Buffer:
         if self.runtime.get_num_rdma_ranks() > 1:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
-                                           previous_event, async_finish, allocate_on_comm_stream, unzip_alignment)
+                                           previous_event, async_finish, allocate_on_comm_stream, unzip_alignment, unzip_chunk_size)
 
         assert unzip_alignment == 0, 'fused unzip is internode-only'
 
@@ -475,7 +479,8 @@ class Buffer:
                            num_worst_tokens: int = 0, config: Optional[Config] = None,
                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                            allocate_on_comm_stream: bool = False,
-                           unzip_alignment: int = 0) -> \
+                           unzip_alignment: int = 0,
+                           unzip_chunk_size: int = 0) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -494,11 +499,11 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-                0)
+                0, 0)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -506,18 +511,21 @@ class Buffer:
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head, unzipped_tokens, unzipped_probs, event = self.runtime.internode_dispatch(
+                recv_src_meta, send_rdma_head, send_nvl_head, \
+                unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, task_queue, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-                unzip_alignment)
+                unzip_alignment, unzip_chunk_size)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
             ret = ((recv_x, recv_x_scales) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights,
                    num_recv_tokens_per_expert_list, handle, EventOverlap(event))
-            return ret + (unzipped_tokens, unzipped_probs) if unzip_alignment > 0 else ret
+            if unzip_alignment > 0:
+                return ret + (unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, task_queue)
+            return ret
 
     # noinspection PyTypeChecker
     def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],

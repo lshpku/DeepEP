@@ -482,7 +482,13 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int4* unzipped_x,
              float* unzipped_probs,
              int* unzipped_expert_counter,
-             const int* unzipped_expert_offset) {
+             const int* unzip_expert_meta,
+             int* atomic_to_zip,
+             int* zip_to_atomic,
+             int* unzip_chunk_done,
+             int* task_queue,
+             int* task_queue_counter,
+             int unzip_chunk_size) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -1065,11 +1071,15 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         const int local_expert_begin = rank * num_local_experts;
         const int local_expert_end = local_expert_begin + num_local_experts;
 
-        // Cache each local expert's base offset in `unzipped_x` (fused unzip), one lane per expert
-        int cached_unzip_offset = 0;
+        // Cache each local expert's fused-unzip metadata, one lane per expert
+        int cached_unzip_base = 0, cached_unzip_count = 0, cached_unzip_chunk_base = 0;
         if (unzipped_x != nullptr) {
             EP_DEVICE_ASSERT(num_local_experts <= 32);
-            cached_unzip_offset = lane_id < num_local_experts ? ld_nc_global(unzipped_expert_offset + lane_id) : 0;
+            if (lane_id < num_local_experts) {
+                cached_unzip_base = ld_nc_global(unzip_expert_meta + lane_id * 3);
+                cached_unzip_count = ld_nc_global(unzip_expert_meta + lane_id * 3 + 1);
+                cached_unzip_chunk_base = ld_nc_global(unzip_expert_meta + lane_id * 3 + 2);
+            }
         }
 
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
@@ -1199,26 +1209,55 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 // Multicast the token into each of its local experts' region of `unzipped_x` (fused unzip)
                 // NOTES: the slot inside a region is grabbed atomically, so the order is non-deterministic
                 if (unzipped_x != nullptr) {
-                    // Every hit lane grabs its own slot in parallel, so the warp pays a single atomic
-                    // round-trip per token instead of one per (token, expert) pair
-                    // NOTES: a token never selects the same expert twice, so the lanes never collide here
-                    auto expert_offset = __shfl_sync(0xffffffff, cached_unzip_offset, max(local_expert_idx, 0));
-                    int64_t unzipped_idx = 0;
+                    // Broadcast the hit experts' metadata before diverging, as all the lanes must
+                    // take part in the shuffles
+                    auto meta_lane = max(local_expert_idx, 0);
+                    auto expert_base = __shfl_sync(0xffffffff, cached_unzip_base, meta_lane);
+                    auto expert_count = __shfl_sync(0xffffffff, cached_unzip_count, meta_lane);
+                    auto expert_chunk_base = __shfl_sync(0xffffffff, cached_unzip_chunk_base, meta_lane);
+
+                    // Every hit lane issues its own copy, so the warp pays a single atomic round-trip
+                    // per token and each lane's completion wait covers exactly its own copy
+                    // NOTES: a token never selects the same expert twice, so the lanes never collide
                     if (local_expert_idx >= 0) {
                         auto slot = atomicAdd(unzipped_expert_counter + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
-                        unzipped_idx = static_cast<int64_t>(expert_offset) + slot;
+                        auto unzipped_idx = static_cast<int64_t>(expert_base) + slot;
+
+                        tma_store_1d(tma_buffer, unzipped_x + unzipped_idx * hidden_int4, hidden_bytes, false);
                         st_na_global(unzipped_probs + unzipped_idx, local_expert_prob);
-                    }
+                        st_na_global(atomic_to_zip + unzipped_idx, static_cast<int>(recv_token_idx));
+                        st_na_global(zip_to_atomic + recv_token_idx * num_topk + lane_id, static_cast<int>(unzipped_idx));
 
-                    // Issue the copies from a single lane, as the source is the whole warp's TMA buffer
-                    auto expert_mask = __ballot_sync(0xffffffff, local_expert_idx >= 0);
-                    while (expert_mask != 0) {
-                        auto src_lane = __ffs(static_cast<int>(expert_mask)) - 1;
-                        expert_mask &= expert_mask - 1;
+                        // Wait for our own copy to land, so that the release below has something
+                        // complete to publish
+                        tma_store_wait_complete<0>();
 
-                        auto dst_idx = __shfl_sync(0xffffffff, unzipped_idx, src_lane);
-                        if (elect_one_sync())
-                            tma_store_1d(tma_buffer, unzipped_x + dst_idx * hidden_int4, hidden_bytes, false);
+                        // A chunk is only complete once all of its slots are written, and the writers
+                        // are spread over many warps and SMs, so count the completions per chunk and let
+                        // whoever happens to finish last enqueue the task
+                        auto chunk_in_expert = slot / unzip_chunk_size;
+                        auto chunk_begin = chunk_in_expert * unzip_chunk_size;
+                        auto chunk_size = min(unzip_chunk_size, expert_count - chunk_begin);
+
+                        // Release point: everything written above becomes visible device-wide before the
+                        // counter does, because a concurrently running consumer acquires through `task_queue`
+                        auto num_done = atomic_add_release_gpu(unzip_chunk_done + expert_chunk_base + chunk_in_expert, 1);
+                        if (num_done + 1 == chunk_size) {
+                            // The acquire side, so that the other writers' releases are inherited and carried
+                            // over to the consumer by the `ready` store below. Only the last writer of a chunk
+                            // needs it, so this fence is paid per chunk rather than per token
+                            // NOTES: on current hardware this looks redundant, as observing their releases
+                            // already implies their data reached L2; it is here for the memory model's sake
+                            // and would become load-bearing if this branch ever reads the chunk's data
+                            __threadfence();
+
+                            // NOTES: the queue must stay FIFO for the compute side, hence the push counter
+                            auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
+                            st_na_global(entry + 0, local_expert_idx);
+                            st_na_global(entry + 1, expert_base + chunk_begin);
+                            st_na_global(entry + 2, chunk_size);
+                            st_release_sys_global(entry + 3, 1);
+                        }
                     }
                     __syncwarp();
                 }
@@ -1292,7 +1331,13 @@ void dispatch(void* recv_x,
               void* unzipped_x,
               float* unzipped_probs,
               int* unzipped_expert_counter,
-              const int* unzipped_expert_offset) {
+              const int* unzip_expert_meta,
+              int* atomic_to_zip,
+              int* zip_to_atomic,
+              int* unzip_chunk_done,
+              int* task_queue,
+              int* task_queue_counter,
+              int unzip_chunk_size) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1347,7 +1392,13 @@ void dispatch(void* recv_x,
                       reinterpret_cast<int4*>(unzipped_x),                                                                     \
                       unzipped_probs,                                                                                          \
                       unzipped_expert_counter,                                                                                 \
-                      unzipped_expert_offset);                                                                                 \
+                      unzip_expert_meta,                                                                                       \
+                      atomic_to_zip,                                                                                           \
+                      zip_to_atomic,                                                                                           \
+                      unzip_chunk_done,                                                                                        \
+                      task_queue,                                                                                              \
+                      task_queue_counter,                                                                                      \
+                      unzip_chunk_size);                                                                                       \
     }                                                                                                                          \
     break
 

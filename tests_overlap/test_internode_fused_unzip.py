@@ -18,6 +18,7 @@ TOPK = 8
 
 NUM_SMS = 48
 ALIGNMENT = 128
+CHUNK = 4096
 
 
 def prepare_case_inputs(group):
@@ -69,6 +70,7 @@ def run_dispatch(group, buffer, x, token_probs, token_indices, unzip_alignment):
         async_finish=False,
         allocate_on_comm_stream=False,
         unzip_alignment=unzip_alignment,
+        unzip_chunk_size=CHUNK if unzip_alignment > 0 else 0,
     )
 
 
@@ -116,6 +118,106 @@ def check_fused_unzip(recv_x, recv_token_indices, recv_token_probs, tokens_per_e
     return ok
 
 
+def expert_layout(tokens_per_expert):
+    """复算 host 侧的分段: 每个专家在 unzipped_tokens 里的基址和 chunk 基址."""
+    layout, base, chunk_base = [], 0, 0
+    for n in tokens_per_expert:
+        layout.append((base, n, chunk_base))
+        base += (n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
+        chunk_base += (n + CHUNK - 1) // CHUNK
+    return layout, base, chunk_base
+
+
+def check_mapping_tables(recv_x, recv_token_indices, tokens_per_expert,
+                         unzipped_tokens, atomic_to_zip, zip_to_atomic):
+    """
+    两张表的校验, 三件事:
+      1. padding / 无效 topk 位置必须保持 -1
+      2. atomic_to_zip 指向的 recv_x 行必须和该槽位的 token 内容一致
+      3. 两张表互为逆映射, 且 zip_to_atomic 指向的槽位落在正确的专家段内
+    """
+    layout, num_unzipped, _ = expert_layout(tokens_per_expert)
+    a2z = atomic_to_zip.astype("int64")
+    z2a = zip_to_atomic.astype("int64")
+    ok = True
+
+    # 1. 有效槽位就是每个专家段的前 n 行, 其余必须是 -1
+    valid_slot = paddle.zeros([num_unzipped], dtype="bool")
+    for base, n, _ in layout:
+        if n > 0:
+            valid_slot[base:base + n] = True
+    if not bool(((a2z >= 0) == valid_slot).all().item()):
+        ok = False
+        print("  atomic_to_zip: 有效位置与预期分段不符,"
+              f" 实际有效 {int((a2z >= 0).sum().item())} 预期 {int(valid_slot.sum().item())}")
+
+    valid_pair = recv_token_indices >= 0
+    if not bool(((z2a >= 0) == valid_pair).all().item()):
+        ok = False
+        print("  zip_to_atomic: 有效位置与 recv_token_indices 不符")
+
+    # 2. 槽位内容必须等于它指向的那个 recv_x 行
+    slots = paddle.nonzero(valid_slot).flatten()
+    content_diff = (unzipped_tokens[slots].astype("float32")
+                    - recv_x[a2z[slots]].astype("float32")).abs().max().item()
+    if content_diff != 0.0:
+        ok = False
+        print(f"  atomic_to_zip: 指向的 recv_x 行与槽位内容不一致, max diff {content_diff}")
+
+    # 3. 互为逆映射, 且落在正确的专家段
+    pairs = paddle.nonzero(valid_pair)
+    tok, slot = pairs[:, 0], z2a[valid_pair]
+    if not bool((a2z[slot] == tok).all().item()):
+        ok = False
+        print("  zip_to_atomic / atomic_to_zip 不互逆")
+
+    expert_of_pair = recv_token_indices[valid_pair].astype("int64")
+    bases = paddle.to_tensor([b for b, _, _ in layout], dtype="int64")
+    counts = paddle.to_tensor([n for _, n, _ in layout], dtype="int64")
+    lo, hi = bases[expert_of_pair], bases[expert_of_pair] + counts[expert_of_pair]
+    if not bool(paddle.logical_and(slot >= lo, slot < hi).all().item()):
+        ok = False
+        print("  zip_to_atomic: 有槽位落在了错误的专家段内")
+
+    print("mapping tables check:", "PASS" if ok else "FAIL")
+    return ok
+
+
+def check_task_queue(tokens_per_expert, task_queue):
+    """
+    task_queue 校验: 每个 chunk 恰好入队一次, 全部 ready, 且描述符与预期分段一致.
+    入队顺序是 chunk 的完成顺序(非确定), 所以按集合比对; 但 FIFO 要求 ready 从 0 开始
+    密集填充, 不能有空洞.
+    """
+    layout, _, num_chunks = expert_layout(tokens_per_expert)
+    expected = set()
+    for e, (base, n, _) in enumerate(layout):
+        for c in range((n + CHUNK - 1) // CHUNK):
+            expected.add((e, base + c * CHUNK, min(CHUNK, n - c * CHUNK)))
+
+    ok = True
+    if task_queue.shape[0] != num_chunks:
+        ok = False
+        print(f"  task_queue 行数 {task_queue.shape[0]} != num_chunks {num_chunks}")
+
+    q = task_queue.astype("int64").numpy()
+    num_ready = int((q[:, 3] == 1).sum())
+    if num_ready != num_chunks:
+        ok = False
+        print(f"  ready 的条目数 {num_ready} != num_chunks {num_chunks}")
+    if not (q[:num_ready, 3] == 1).all():
+        ok = False
+        print("  ready 不是从 0 开始密集填充的, FIFO 语义被破坏")
+
+    actual = {(int(r[0]), int(r[1]), int(r[2])) for r in q[:num_ready]}
+    if actual != expected:
+        ok = False
+        print(f"  描述符集合不符, 缺失 {sorted(expected - actual)[:4]} 多余 {sorted(actual - expected)[:4]}")
+
+    print(f"task_queue check ({num_chunks} chunks):", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     group = initialize_fleet()
     configure_buffer(NUM_SMS)
@@ -125,20 +227,26 @@ def main():
     # warmup
     run_dispatch(group, buffer, x, token_probs, token_indices, 0)
 
-    recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, _, _, unzipped_tokens, unzipped_probs = \
+    recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, _, _, \
+        unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, task_queue = \
         run_dispatch(group, buffer, x, token_probs, token_indices, ALIGNMENT)
 
     print("num_recv_tokens:", recv_x.shape[0], "tokens_per_expert:", tokens_per_expert)
     print("num_unzipped_tokens:", unzipped_tokens.shape[0])
 
+    recv_token_indices = recv_token_indices.cast("int32")
     check_fused_unzip(
         recv_x,
-        recv_token_indices.cast("int32"),
+        recv_token_indices,
         recv_token_probs,
         tokens_per_expert,
         unzipped_tokens,
         unzipped_probs,
     )
+    check_mapping_tables(
+        recv_x, recv_token_indices, tokens_per_expert, unzipped_tokens, atomic_to_zip, zip_to_atomic
+    )
+    check_task_queue(tokens_per_expert, task_queue)
 
     ############################### PERF COMPARE ###############################
 
