@@ -88,7 +88,7 @@ dispatch 原有的主要输出为：
 
 之后，上述两个变量就会给到计算部分进行计算，计算过程的 buffer 如下，在各 buffer 中 token 的位置都是不变的，都向 unzipped_tokens 对齐，其实 o1/o2 我们不用管，只看 o3 就行
 * `o1`[num_unzipped_tokens, 2*intermediate_size] bf16 : gateup 的输出
-* `o2`[num_unzipped_tokens, intermediate_size] bf16 : weighted_swiglu 的输出
+* `o2`[num_unzipped_tokens, intermediate_size] bf16 : weighted_swiglu 的输出，注意 unzipped_probs 是在这里乘寄去而不是到后面 zip 的时候才乘，后面 zip 只有加法
 * `o3`[num_unzipped_tokens, hidden_size] bf16 : down 的输出
 
 zip 需要监控 o3 的完成情况，当一个 token 在 o3 里面已经被所有它所属的专家完成，就可以进行累加，累加结果输出到一个新 buffer，作为 combine 的输入
