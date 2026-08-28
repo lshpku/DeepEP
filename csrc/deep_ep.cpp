@@ -1390,7 +1390,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                          atomic_to_zip,
                          zip_to_atomic,
                          num_valid_topk,
-                         task_queue}) {
+                         task_queue,
+                         // NOTES: non-returned tensors must be recorded on comm_stream to keep
+                         // them alive util dispatch finishes
+                         unzipped_expert_counter,
+                         unzip_expert_meta,
+                         unzip_chunk_done,
+                         task_queue_counter}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
