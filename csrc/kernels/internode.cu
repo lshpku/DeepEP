@@ -1839,6 +1839,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                                         const int* rdma_channel_prefix_matrix,
                                                                         const int* rdma_rank_prefix_sum,
                                                                         const int* gbl_channel_prefix_matrix,
+                                                                        const int* zip_done,
                                                                         int num_tokens,
                                                                         int num_combined_tokens,
                                                                         int hidden,
@@ -2001,6 +2002,27 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     // Load data
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
                     auto shifted_x = x + token_idx * hidden_int4;
+
+                    // Wait until zip has produced this token. The tokens of a channel are sent in
+                    // order and cannot be skipped, so this is a plain per-token wait
+                    // NOTES: this is also the acquire that publishes zip's writes to `x`
+                    if (zip_done != nullptr) {
+                        if (elect_one_sync()) {
+                            auto zip_start_time = clock64();
+                            while (ld_acquire_global(zip_done + token_idx) == 0) {
+                                if (clock64() - zip_start_time > NUM_TIMEOUT_CYCLES) {
+                                    printf("DeepEP combine NVL sender timeout on zip, channel: %d, RDMA: %d, nvl: %d, token: %ld\n",
+                                           channel_id,
+                                           rdma_rank,
+                                           nvl_rank,
+                                           static_cast<int64_t>(token_idx));
+                                    trap();
+                                }
+                            }
+                        }
+                        __syncwarp();
+                    }
+
                     tma_store_wait<0>();
                     if (elect_one_sync()) {
                         tma_load_1d(tma_buffer, shifted_x, tma_mbarrier, hidden_bytes);
@@ -2402,6 +2424,7 @@ void combine(cudaDataType_t type,
              const int* rdma_channel_prefix_matrix,
              const int* rdma_rank_prefix_sum,
              const int* gbl_channel_prefix_matrix,
+             const int* zip_done,
              int num_tokens,
              int num_combined_tokens,
              int hidden,
@@ -2453,6 +2476,7 @@ void combine(cudaDataType_t type,
                       rdma_channel_prefix_matrix,                                     \
                       rdma_rank_prefix_sum,                                           \
                       gbl_channel_prefix_matrix,                                      \
+                      zip_done,                                                       \
                       num_tokens,                                                     \
                       num_combined_tokens,                                            \
                       hidden,                                                         \

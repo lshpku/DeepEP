@@ -1453,13 +1453,19 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const Config& config,
     std::optional<EventHandle>& previous_event,
     bool async,
-    bool allocate_on_comm_stream) {
+    bool allocate_on_comm_stream,
+    const std::optional<torch::Tensor>& zip_done) {
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
 
     // Shape and contiguous checks
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    if (zip_done.has_value()) {
+        // One flag per token of `x`, set by zip; the sender blocks on it instead of sending blindly
+        EP_HOST_ASSERT(zip_done->dim() == 1 and zip_done->is_contiguous() and zip_done->scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(zip_done->size(0) == x.size(0));
+    }
     EP_HOST_ASSERT(src_meta.dim() == 2 and src_meta.is_contiguous() and src_meta.scalar_type() == torch::kByte);
     EP_HOST_ASSERT(is_combined_token_in_rank.dim() == 2 and is_combined_token_in_rank.is_contiguous() and
                    is_combined_token_in_rank.scalar_type() == torch::kBool);
@@ -1572,6 +1578,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        rdma_channel_prefix_matrix.data_ptr<int>(),
                        rdma_rank_prefix_sum.data_ptr<int>(),
                        gbl_channel_prefix_matrix.data_ptr<int>(),
+                       zip_done.has_value() ? zip_done->data_ptr<int>() : nullptr,
                        num_tokens,
                        num_combined_tokens,
                        hidden,
@@ -1605,7 +1612,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to : {topk_weights, combined_topk_weights, bias_0, bias_1}) {
+        for (auto& to : {topk_weights, combined_topk_weights, bias_0, bias_1, zip_done}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();

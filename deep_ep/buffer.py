@@ -425,7 +425,8 @@ class Buffer:
                 config: Optional[Config] = None,
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                 allocate_on_comm_stream: bool = False,
-                skip_x_record_stream: bool = False) -> \
+                skip_x_record_stream: bool = False,
+                zip_done: Optional[torch.Tensor] = None) -> \
                 Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
 
         """
@@ -444,6 +445,9 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            zip_done: `[num_tokens]` with `torch.int32`, optional. If given, the sender waits for `zip_done[i] != 0`
+                before sending token `i`, in order and without skipping, so that combine can overlap with zip.
+                If not given, the tokens are sent unconditionally, exactly like the original kernel. Internode only.
 
         Returns:
             recv_x: the reduced token from its dispatched ranks.
@@ -456,7 +460,10 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
+            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish,
+                                          allocate_on_comm_stream, zip_done)
+
+        assert zip_done is None, 'the zip signal is internode-only'
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
         rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
@@ -533,7 +540,8 @@ class Buffer:
                           bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                           config: Optional[Config] = None,
                           previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                          allocate_on_comm_stream: bool = False) -> \
+                          allocate_on_comm_stream: bool = False,
+                          zip_done: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Internode combine implementation, for more details, please refer to the `combine` docs.
@@ -553,8 +561,8 @@ class Buffer:
                                                                                   is_combined_token_in_rank, rdma_channel_prefix_matrix,
                                                                                   rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
                                                                                   send_rdma_head, send_nvl_head, config,
-                                                                                  getattr(previous_event, 'event',
-                                                                                          None), async_finish, allocate_on_comm_stream)
+                                                                                  getattr(previous_event, 'event', None), async_finish,
+                                                                                  allocate_on_comm_stream, zip_done)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:

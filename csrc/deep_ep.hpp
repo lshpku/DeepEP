@@ -274,7 +274,8 @@ public:
         const Config& config,
         std::optional<EventHandle>& previous_event,
         bool async,
-        bool allocate_on_comm_stream);
+        bool allocate_on_comm_stream,
+        const std::optional<torch::Tensor>& zip_done = std::nullopt);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 
