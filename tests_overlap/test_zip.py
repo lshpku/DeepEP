@@ -124,7 +124,7 @@ def main():
         paddle.base.core.nvprof_nvtx_push("assign")
         task_queue[:] = task_order
         paddle.base.core.nvprof_nvtx_pop()
-    
+
     ok = check("[zip delay]", out, zip_done, out_ref) and ok
 
     # 性能测试
